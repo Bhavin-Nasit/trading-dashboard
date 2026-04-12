@@ -15,6 +15,7 @@ import traceback
 from pathlib import Path
 from flask import Flask, jsonify
 from flask_cors import CORS
+from flask import send_from_directory
 
 app = Flask(__name__)
 CORS(app)
@@ -371,6 +372,10 @@ def api_all():
         "marketOpen":     is_market_open(),
         "serverTime":     ist_now(),
     })
+
+@app.route("/")
+def home():
+    return send_from_directory(".", "index.html")
 
 @app.route("/api/indices")
 def api_indices():
