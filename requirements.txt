@@ -1,0 +1,3 @@
+nse[local]
+flask
+flask-cors
