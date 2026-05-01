@@ -1,3 +1,5 @@
-nse[local]
+nse[local,server]
 flask
 flask-cors
+gunicorn
+requests
