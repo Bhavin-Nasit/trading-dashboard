@@ -20,6 +20,9 @@ The original app showed raw NSE panels: indices, FII/DII cash, option-chain OI, 
 - Daily, weekly, and monthly scorecards based on separate NIFTY expiries.
 - Put base, call wall, max pain, expected range, PCR, OI change percentage, and OI pressure.
 - FII/DII cash interpretation and participant-wise FII, Pro, Client, and DII derivative tilt.
+- Excel-style big-player prediction model using current versus previous participant OI.
+- Trap detector for retail long traps, retail short traps, call-buying traps, and put-buying traps.
+- FII / Pro / Client / DII delta matrix showing one-day changes in futures, call writing, and put writing.
 - Invalidation level and a plain-English hidden story behind the move.
 
 ## Run Locally

@@ -28,6 +28,14 @@ DATA_DIR = Path(os.environ.get("NSE_DATA_DIR", "nse_data"))
 DATA_DIR.mkdir(exist_ok=True)
 SNAPSHOT_FILE = DATA_DIR / "nifty_signal_history.json"
 CACHE_SEC = int(os.environ.get("CACHE_SEC", "90"))
+PARTICIPANT_COLUMNS = (
+    "Future Index Long",
+    "Future Index Short",
+    "Option Index Call Long",
+    "Option Index Call Short",
+    "Option Index Put Long",
+    "Option Index Put Short",
+)
 
 _cache: dict[str, tuple[float, Any]] = {}
 _nse = None
@@ -159,6 +167,7 @@ def request_json(url: str, timeout: int = 12) -> Any:
             }
         )
         _http_session.get("https://www.nseindia.com", timeout=timeout)
+    _http_session.headers.update({"Accept": "application/json, text/plain, */*"})
     response = _http_session.get(url, timeout=timeout)
     response.raise_for_status()
     return response.json()
@@ -178,6 +187,7 @@ def request_text(url: str, timeout: int = 12) -> str:
             }
         )
         _http_session.get("https://www.nseindia.com", timeout=timeout)
+    _http_session.headers.update({"Accept": "text/csv,text/plain,*/*"})
     response = _http_session.get(url, timeout=timeout)
     response.raise_for_status()
     return response.text
@@ -482,6 +492,19 @@ def parse_participant_csv(text: str, source_date: dt.date) -> dict[str, Any] | N
     return {"date": source_date.strftime("%d-%b-%Y"), "rows": rows, "source": "NSE participant OI archive"}
 
 
+def participant_deltas(
+    latest: dict[str, dict[str, Any]],
+    previous: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, int]]:
+    deltas: dict[str, dict[str, int]] = {}
+    for name in sorted(set(latest) | set(previous)):
+        deltas[name] = {
+            col: safe_int(latest.get(name, {}).get(col)) - safe_int(previous.get(name, {}).get(col))
+            for col in PARTICIPANT_COLUMNS
+        }
+    return deltas
+
+
 def fetch_participant_oi() -> dict[str, Any]:
     today = ist_now().date()
     urls = (
@@ -489,7 +512,8 @@ def fetch_participant_oi() -> dict[str, Any]:
         "https://nsearchives.nseindia.com/content/nsccl/fao_participant_oi_{date}.csv",
     )
     errors: list[str] = []
-    for days_back in range(0, 8):
+    found: list[dict[str, Any]] = []
+    for days_back in range(0, 12):
         target = today - dt.timedelta(days=days_back)
         if target.weekday() >= 5:
             continue
@@ -499,9 +523,21 @@ def fetch_participant_oi() -> dict[str, Any]:
                 parsed = parse_participant_csv(request_text(template.format(date=date_key)), target)
                 if parsed:
                     parsed["timestamp"] = ist_stamp()
-                    return parsed
+                    found.append(parsed)
+                    break
             except Exception as exc:
                 errors.append(f"{date_key}: {exc}")
+        if len(found) >= 2:
+            latest, previous = found[0], found[1]
+            latest["previousDate"] = previous.get("date")
+            latest["previousRows"] = previous.get("rows", {})
+            latest["deltas"] = participant_deltas(latest.get("rows", {}), previous.get("rows", {}))
+            return latest
+    if found:
+        found[0]["previousDate"] = None
+        found[0]["previousRows"] = {}
+        found[0]["deltas"] = {}
+        return found[0]
     return {"date": None, "rows": {}, "source": "unavailable", "errors": errors[-3:], "timestamp": ist_stamp()}
 
 
@@ -659,7 +695,7 @@ def cash_flow_score(flows: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def participant_direction(row: dict[str, Any]) -> dict[str, float]:
+def participant_direction(row: dict[str, Any], delta: dict[str, Any] | None = None) -> dict[str, float]:
     fut_long = safe_float(row.get("Future Index Long"))
     fut_short = safe_float(row.get("Future Index Short"))
     call_long = safe_float(row.get("Option Index Call Long"))
@@ -670,10 +706,27 @@ def participant_direction(row: dict[str, Any]) -> dict[str, float]:
     option_net = (call_long - call_short) + (put_short - put_long)
     gross = max(fut_long + fut_short + call_long + call_short + put_long + put_short, 1)
     directional_pct = ((fut_net * 2.0 + option_net * 0.7) / gross) * 100
+    delta = delta or {}
+    fut_net_delta = safe_float(delta.get("Future Index Long")) - safe_float(delta.get("Future Index Short"))
+    option_net_delta = (
+        safe_float(delta.get("Option Index Call Long"))
+        - safe_float(delta.get("Option Index Call Short"))
+        + safe_float(delta.get("Option Index Put Short"))
+        - safe_float(delta.get("Option Index Put Long"))
+    )
+    call_writing_delta = safe_float(delta.get("Option Index Call Short")) - safe_float(delta.get("Option Index Call Long"))
+    put_writing_delta = safe_float(delta.get("Option Index Put Short")) - safe_float(delta.get("Option Index Put Long"))
+    gross_delta = max(sum(abs(safe_float(delta.get(col))) for col in PARTICIPANT_COLUMNS), 1)
+    directional_delta_pct = ((fut_net_delta * 2.0 + option_net_delta * 0.7) / gross_delta) * 100
     return {
         "futureNet": round(fut_net),
         "optionNet": round(option_net),
         "directionalPct": round(directional_pct, 2),
+        "futureNetDelta": round(fut_net_delta),
+        "optionNetDelta": round(option_net_delta),
+        "callWritingDelta": round(call_writing_delta),
+        "putWritingDelta": round(put_writing_delta),
+        "directionalDeltaPct": round(directional_delta_pct, 2),
         "longShortRatio": round(fut_long / fut_short, 2) if fut_short else 0,
         "futLong": round(fut_long),
         "futShort": round(fut_short),
@@ -688,20 +741,212 @@ def participant_score(participant: dict[str, Any]) -> dict[str, Any]:
     rows = participant.get("rows", {})
     if not rows:
         return {"score": 50.0, "bias": "Neutral", "details": {}, "drivers": ["Participant OI unavailable"]}
-    details = {name: participant_direction(row) for name, row in rows.items()}
+    deltas = participant.get("deltas", {})
+    details = {name: participant_direction(row, deltas.get(name, {})) for name, row in rows.items()}
     fii_dir = details.get("fii", {}).get("directionalPct", 0)
     pro_dir = details.get("pro", {}).get("directionalPct", 0)
     client_dir = details.get("client", {}).get("directionalPct", 0)
     dii_dir = details.get("dii", {}).get("directionalPct", 0)
-    smart_direction = fii_dir * 0.55 + pro_dir * 0.3 + dii_dir * 0.05 - client_dir * 0.1
+    fii_delta = details.get("fii", {}).get("directionalDeltaPct", 0)
+    pro_delta = details.get("pro", {}).get("directionalDeltaPct", 0)
+    smart_direction = fii_dir * 0.43 + pro_dir * 0.24 + fii_delta * 0.18 + pro_delta * 0.10 + dii_dir * 0.05 - client_dir * 0.10
     score = clamp(50 + smart_direction * 1.8, 5, 95)
     drivers = [
         f"FII derivative tilt {fii_dir:+.1f}%",
         f"Pro desk tilt {pro_dir:+.1f}%",
+        f"FII one-day change {fii_delta:+.1f}%",
+        f"Pro one-day change {pro_delta:+.1f}%",
         f"Client tilt {client_dir:+.1f}% treated contrarian",
         f"Participant data date {participant.get('date') or 'unavailable'}",
     ]
     return {"score": round(score, 1), "bias": bias_label(score), "details": details, "drivers": drivers}
+
+
+def stance_from_score(score: float) -> str:
+    if score >= 62:
+        return "Bullish"
+    if score <= 38:
+        return "Bearish"
+    return "Neutral"
+
+
+def build_check(factor: str, score: float, reading: str) -> dict[str, Any]:
+    return {"factor": factor, "score": round(clamp(score), 1), "stance": stance_from_score(score), "reading": reading}
+
+
+def build_big_player_model(
+    indices: dict[str, Any],
+    options: dict[str, Any],
+    flows: dict[str, Any],
+    participant: dict[str, Any],
+    part_score_data: dict[str, Any],
+) -> dict[str, Any]:
+    details = part_score_data.get("details", {})
+    daily = options.get("views", {}).get("daily", {})
+    fii = details.get("fii", {})
+    pro = details.get("pro", {})
+    client = details.get("client", {})
+    dii = details.get("dii", {})
+    cash_fii = safe_float(flows.get("fii", {}).get("net"))
+    cash_dii = safe_float(flows.get("dii", {}).get("net"))
+    vix = safe_float(indices.get("vix", {}).get("price"))
+    oi_shift = safe_float(daily.get("oiShiftPct"))
+    pcr_value = safe_float(daily.get("pcr"))
+    spot = safe_float(daily.get("spot") or options.get("spot") or indices.get("nifty", {}).get("price"))
+    call_wall = safe_float(daily.get("callWall"))
+    put_base = safe_float(daily.get("putBase"))
+
+    fii_direction = safe_float(fii.get("directionalPct"))
+    pro_direction = safe_float(pro.get("directionalPct"))
+    client_direction = safe_float(client.get("directionalPct"))
+    fii_change = safe_float(fii.get("directionalDeltaPct"))
+    pro_change = safe_float(pro.get("directionalDeltaPct"))
+    client_change = safe_float(client.get("directionalDeltaPct"))
+
+    wall_score = 50.0
+    wall_reading = "No clean wall edge"
+    if spot and call_wall and put_base:
+        resistance_gap = ((call_wall - spot) / spot) * 100
+        support_gap = ((spot - put_base) / spot) * 100
+        if support_gap < resistance_gap:
+            wall_score = 58 + min(18, (resistance_gap - support_gap) * 8)
+            wall_reading = f"Nearest defense is put base {put_base:,.0f}; call wall room {resistance_gap:.2f}%"
+        elif resistance_gap < support_gap:
+            wall_score = 42 - min(18, (support_gap - resistance_gap) * 8)
+            wall_reading = f"Nearest supply is call wall {call_wall:,.0f}; put base room {support_gap:.2f}%"
+
+    cash_score = clamp(50 + cash_fii / 80 + cash_dii / 180, 5, 95)
+    oi_score = clamp(50 + oi_shift * 0.7, 5, 95)
+    fii_score = clamp(50 + fii_direction * 1.5 + fii_change * 0.7, 5, 95)
+    pro_score = clamp(50 + pro_direction * 1.25 + pro_change * 0.65, 5, 95)
+    client_contra_score = clamp(50 - client_direction * 1.15 - client_change * 0.45, 5, 95)
+    volatility_score = 50
+    if vix:
+        volatility_score = 58 if vix < 14 else 52 if vix < 18 else 43 if vix < 22 else 34
+
+    checks = [
+        build_check(
+            "FII carry-forward",
+            fii_score,
+            f"FII directional tilt {fii_direction:+.1f}% with one-day change {fii_change:+.1f}%",
+        ),
+        build_check(
+            "Pro desk confirmation",
+            pro_score,
+            f"Pro directional tilt {pro_direction:+.1f}% with one-day change {pro_change:+.1f}%",
+        ),
+        build_check(
+            "Client contra signal",
+            client_contra_score,
+            f"Client tilt {client_direction:+.1f}%; model treats retail/HNI crowding as contrarian",
+        ),
+        build_check(
+            "FII/DII cash",
+            cash_score,
+            f"FII cash {money_cr(cash_fii)}, DII cash {money_cr(cash_dii)}",
+        ),
+        build_check("Fresh OI pressure", oi_score, f"Put-call OI change pressure {oi_shift:+.1f}% and PCR {pcr_value:.2f}"),
+        build_check("Wall proximity", wall_score, wall_reading),
+        build_check("Volatility filter", volatility_score, f"India VIX {vix:.2f}" if vix else "India VIX unavailable"),
+    ]
+
+    final_score = weighted(
+        [
+            (fii_score, 0.25),
+            (pro_score, 0.20),
+            (client_contra_score, 0.15),
+            (cash_score, 0.14),
+            (oi_score, 0.14),
+            (wall_score, 0.08),
+            (volatility_score, 0.04),
+        ]
+    )
+
+    traps: list[dict[str, str]] = []
+    if fii_direction > 5 and pro_direction > 3 and client_direction < -3:
+        traps.append(
+            {
+                "type": "Retail short trap",
+                "side": "Bullish",
+                "reading": "FII and Pro are net positive while Clients are net short; upside squeeze risk is elevated.",
+            }
+        )
+    if fii_direction < -5 and pro_direction < -3 and client_direction > 3:
+        traps.append(
+            {
+                "type": "Retail long trap",
+                "side": "Bearish",
+                "reading": "FII and Pro are net negative while Clients are net long; downside flush risk is elevated.",
+            }
+        )
+    if safe_float(pro.get("callWritingDelta")) > 0 and safe_float(client.get("callLong")) > safe_float(client.get("putLong")):
+        traps.append(
+            {
+                "type": "Call buying trap",
+                "side": "Bearish",
+                "reading": "Pro call writing is rising while Clients carry more call longs than put longs.",
+            }
+        )
+    if safe_float(pro.get("putWritingDelta")) > 0 and safe_float(client.get("putLong")) > safe_float(client.get("callLong")):
+        traps.append(
+            {
+                "type": "Put buying trap",
+                "side": "Bullish",
+                "reading": "Pro put writing is rising while Clients carry more put longs than call longs.",
+            }
+        )
+    if cash_fii < -1000 and fii_change > 3:
+        traps.append(
+            {
+                "type": "Cash sell, derivatives hedge",
+                "side": "Neutral",
+                "reading": "FII cash is negative but derivative tilt improved; avoid reading cash selling alone.",
+            }
+        )
+    if not traps:
+        traps.append(
+            {
+                "type": "No obvious crowd trap",
+                "side": "Neutral",
+                "reading": "Participant groups are not cleanly opposite yet; wait for stronger divergence.",
+            }
+        )
+
+    if final_score >= 62:
+        prediction = "Next session bias is positive; prefer buy-on-dip until the put base fails."
+    elif final_score <= 38:
+        prediction = "Next session bias is negative; prefer sell-on-rise until the call wall is reclaimed."
+    else:
+        prediction = "Next session edge is mixed; trade the range and wait for FII/Pro alignment."
+
+    matrix = []
+    for name in ("fii", "pro", "client", "dii"):
+        item = details.get(name, {})
+        matrix.append(
+            {
+                "name": name.upper(),
+                "directionalPct": item.get("directionalPct", 0),
+                "directionalDeltaPct": item.get("directionalDeltaPct", 0),
+                "futureNet": item.get("futureNet", 0),
+                "futureNetDelta": item.get("futureNetDelta", 0),
+                "callWritingDelta": item.get("callWritingDelta", 0),
+                "putWritingDelta": item.get("putWritingDelta", 0),
+                "longShortRatio": item.get("longShortRatio", 0),
+            }
+        )
+
+    return {
+        "score": round(final_score, 1),
+        "bias": bias_label(final_score),
+        "action": action_label(final_score),
+        "prediction": prediction,
+        "date": participant.get("date"),
+        "previousDate": participant.get("previousDate"),
+        "checks": checks,
+        "traps": traps,
+        "matrix": matrix,
+        "sourceNote": "Modeled from NSE participant-wise OI current day versus previous trading day.",
+    }
 
 
 def bias_label(score: float) -> str:
@@ -827,11 +1072,13 @@ def build_conclusion(
         name: build_horizon(name, option_views.get(name, {}), idx, cash, part)
         for name in ("daily", "weekly", "monthly")
     }
+    excel_model = build_big_player_model(indices, options, flows, participant, part)
     final_score = weighted(
         [
-            (horizons["daily"]["score"], 0.44),
-            (horizons["weekly"]["score"], 0.36),
-            (horizons["monthly"]["score"], 0.20),
+            (horizons["daily"]["score"], 0.36),
+            (horizons["weekly"]["score"], 0.28),
+            (horizons["monthly"]["score"], 0.16),
+            (excel_model["score"], 0.20),
         ]
     )
     daily_levels = horizons["daily"]["levels"]
@@ -897,6 +1144,7 @@ def build_conclusion(
         "hiddenStory": hidden,
         "spot": spot,
         "horizons": horizons,
+        "excelModel": excel_model,
         "componentScores": {"trend": idx, "cash": cash, "participants": part},
         "history": history_summary(),
     }
@@ -1205,6 +1453,31 @@ footer { color: var(--soft); font-size: 11px; line-height: 1.6; margin-top: 18px
     </div>
   </section>
 
+  <section class="grid g2 section">
+    <div class="card">
+      <div class="label">Excel-style next session model</div>
+      <div id="excelPanel"></div>
+    </div>
+    <div class="card">
+      <div class="label">Trap detector</div>
+      <div id="trapPanel"></div>
+    </div>
+  </section>
+
+  <section class="card section">
+    <div class="label">FII / PRO / CLIENT / DII delta matrix</div>
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Player</th><th>Directional %</th><th>1D Change</th><th>Future Net</th><th>Future Net d</th><th>Call Writing d</th><th>Put Writing d</th><th>L/S</th>
+          </tr>
+        </thead>
+        <tbody id="playerMatrix"><tr><td colspan="8" class="loading">Loading participant matrix</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
   <footer>
     Research dashboard only. This is not financial advice, investment advice, or a recommendation to buy or sell.
     NSE public APIs can be delayed or temporarily unavailable; verify critical data on NSE before acting.
@@ -1289,6 +1562,7 @@ function render(data) {
   renderIndexPanel(indices);
   renderParticipants(data.participantOI || {}, c.componentScores?.participants || {});
   renderDeals(data.bulkDeals || {});
+  renderExcelModel(c.excelModel || {});
 }
 
 function renderHorizons(horizons) {
@@ -1395,6 +1669,44 @@ function renderDeals(data) {
       <strong class="${d.side === "BUY" ? "green" : "red"}">${esc(d.side)} Rs.${fmt(d.valueCr,1)} Cr</strong>
     </div>
   `).join("");
+}
+
+function renderExcelModel(model) {
+  const checks = model.checks || [];
+  const traps = model.traps || [];
+  const matrix = model.matrix || [];
+  document.getElementById("excelPanel").innerHTML = `
+    <div class="med ${tone(model.score || 50)}">${esc(model.action || "--")}</div>
+    <div class="scoreband"><div class="scorefill" style="width:${model.score || 0}%;background:${fillColor(model.score || 50)}"></div></div>
+    <div class="small" style="margin-top:8px">Excel model score ${fmt(model.score,1)} | ${esc(model.bias || "--")}</div>
+    <div class="small" style="margin-top:8px">${esc(model.prediction || "--")}</div>
+    <div class="small" style="margin-top:8px">OI date ${esc(model.date || "--")} vs ${esc(model.previousDate || "--")}</div>
+    <div class="section">
+      ${checks.map(ch => kv(`${ch.factor} (${ch.stance})`, `${fmt(ch.score,1)} - ${ch.reading}`, tone(ch.score))).join("")}
+    </div>
+  `;
+  document.getElementById("trapPanel").innerHTML = traps.length
+    ? traps.map(t => `
+      <div class="kv">
+        <span><strong>${esc(t.type)}</strong><br><small>${esc(t.reading)}</small></span>
+        <strong class="${t.side === "Bullish" ? "green" : t.side === "Bearish" ? "red" : "amber"}">${esc(t.side)}</strong>
+      </div>
+    `).join("")
+    : `<div class="small">No trap model output.</div>`;
+  document.getElementById("playerMatrix").innerHTML = matrix.length
+    ? matrix.map(row => `
+      <tr>
+        <td><strong>${esc(row.name)}</strong></td>
+        <td class="${tone(Number(row.directionalPct || 0) + 50)}">${signed(row.directionalPct,1)}%</td>
+        <td class="${tone(Number(row.directionalDeltaPct || 0) + 50)}">${signed(row.directionalDeltaPct,1)}%</td>
+        <td class="${cls(row.futureNet)}">${fmt(row.futureNet,0)}</td>
+        <td class="${cls(row.futureNetDelta)}">${signed(row.futureNetDelta,0)}</td>
+        <td class="${cls(-Number(row.callWritingDelta || 0))}">${signed(row.callWritingDelta,0)}</td>
+        <td class="${cls(row.putWritingDelta)}">${signed(row.putWritingDelta,0)}</td>
+        <td>${fmt(row.longShortRatio,2)}</td>
+      </tr>
+    `).join("")
+    : `<tr><td colspan="8" class="loading">Participant deltas unavailable</td></tr>`;
 }
 
 document.getElementById("refreshBtn").addEventListener("click", refresh);
