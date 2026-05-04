@@ -1336,12 +1336,19 @@ tr:last-child td { border-bottom: 0; }
 .drivers { margin: 8px 0 0; padding: 0; list-style: none; }
 .drivers li { color: var(--muted); font-size: 12px; padding: 4px 0; line-height: 1.35; }
 .split { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.read-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.read-card { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 10px; min-width: 0; }
+.read-title { display: flex; justify-content: space-between; gap: 8px; align-items: center; margin-bottom: 7px; }
+.read-title strong { color: var(--text); }
+.read-card p { margin: 6px 0 0; color: var(--muted); font-size: 12px; line-height: 1.45; }
+.guide { color: var(--soft); font-size: 11px; line-height: 1.5; margin: 8px 0 10px; }
 .error { color: var(--red); }
 .loading { color: var(--muted); padding: 20px; }
 footer { color: var(--soft); font-size: 11px; line-height: 1.6; margin-top: 18px; border-top: 1px solid var(--line); padding-top: 14px; }
 @media (max-width: 1080px) {
   .g4, .g3, .g2, .conclusion { grid-template-columns: 1fr 1fr; }
   .horizon { grid-template-columns: 1fr; }
+  .read-grid { grid-template-columns: 1fr 1fr; }
 }
 @media (max-width: 720px) {
   .shell { padding: 12px; }
@@ -1350,6 +1357,7 @@ footer { color: var(--soft); font-size: 11px; line-height: 1.6; margin-top: 18px
   .controls { justify-content: stretch; }
   .btn, .pill { width: 100%; justify-content: center; }
   .g4, .g3, .g2, .conclusion, .split { grid-template-columns: 1fr; }
+  .read-grid { grid-template-columns: 1fr; }
   .big { font-size: 30px; }
   .actionText { font-size: 28px; }
 }
@@ -1466,6 +1474,12 @@ footer { color: var(--soft); font-size: 11px; line-height: 1.6; margin-top: 18px
 
   <section class="card section">
     <div class="label">FII / PRO / CLIENT / DII delta matrix</div>
+    <div class="guide">
+      Directional % shows current net bias. 1D Change shows whether that bias improved or worsened.
+      Call Writing d above zero usually creates resistance; Put Writing d above zero usually creates support.
+      Client data is treated with a contrarian lens when it sharply disagrees with FII/Pro.
+    </div>
+    <div id="playerReadPanel" class="read-grid"></div>
     <div class="tablewrap">
       <table>
         <thead>
@@ -1671,6 +1685,93 @@ function renderDeals(data) {
   `).join("");
 }
 
+function rowByName(matrix, name) {
+  return (matrix || []).find(row => String(row.name || "").toUpperCase() === name) || {};
+}
+
+function playerStance(row) {
+  const dir = Number(row.directionalPct || 0);
+  const chg = Number(row.directionalDeltaPct || 0);
+  const side = dir > 8 ? "net bullish" : dir < -8 ? "net bearish" : "mixed";
+  const move = chg > 2 ? "improving" : chg < -2 ? "deteriorating" : "steady";
+  return `${side}, ${move}`;
+}
+
+function optionRead(row) {
+  const callWrite = Number(row.callWritingDelta || 0);
+  const putWrite = Number(row.putWritingDelta || 0);
+  if (callWrite > 0 && putWrite > 0) {
+    return callWrite > putWrite
+      ? "writing both sides, but calls more; resistance is heavier"
+      : "writing both sides, but puts more; support is stronger";
+  }
+  if (callWrite < 0 && putWrite > 0) return "reducing call pressure and adding put support";
+  if (callWrite > 0 && putWrite < 0) return "adding call pressure and reducing put support";
+  if (callWrite < 0 && putWrite < 0) return "reducing option writing; option buyers/hedges are active";
+  return "options change is not decisive";
+}
+
+function playerMeaning(row, allRows) {
+  const name = String(row.name || "").toUpperCase();
+  const dir = Number(row.directionalPct || 0);
+  const fut = Number(row.futureNet || 0);
+  const fii = rowByName(allRows, "FII");
+  const pro = rowByName(allRows, "PRO");
+  if (name === "FII") {
+    if (dir < -8 && fut < 0) return "Foreign institutions are still carrying a short/bearish book. Rallies need FII short covering to sustain.";
+    if (dir > 8 && fut > 0) return "Foreign institutions are carrying a long/bullish book. Dips have better odds of being bought.";
+    return "FII book is hedged or mixed. Do not read one column alone; wait for futures plus options to align.";
+  }
+  if (name === "PRO") {
+    return "Pro desks are expiry-sensitive. Their call/put writing often marks near-term resistance/support.";
+  }
+  if (name === "CLIENT") {
+    const fiiDir = Number(fii.directionalPct || 0);
+    const proDir = Number(pro.directionalPct || 0);
+    if (dir > 5 && (fiiDir < -5 || proDir < -5)) return "Clients are long while smart money is weak; this can become a retail long trap.";
+    if (dir < -5 && (fiiDir > 5 || proDir > 5)) return "Clients are short while smart money is strong; upside squeeze risk rises.";
+    return "Client positioning is useful mainly as a crowd/contrarian signal.";
+  }
+  if (name === "DII") {
+    return "DII derivative data is supportive context, but slower than FII/Pro for short-term NIFTY direction.";
+  }
+  return "No interpretation available.";
+}
+
+function playerAction(row, allRows) {
+  const name = String(row.name || "").toUpperCase();
+  const dir = Number(row.directionalPct || 0);
+  const futDelta = Number(row.futureNetDelta || 0);
+  const callWrite = Number(row.callWritingDelta || 0);
+  const putWrite = Number(row.putWritingDelta || 0);
+  const fii = rowByName(allRows, "FII");
+  const pro = rowByName(allRows, "PRO");
+  if (name === "FII") {
+    if (dir < -8 && futDelta < 0) return "Action: avoid aggressive longs; sell-rise bias until FII shorts reduce.";
+    if (dir < -8 && putWrite > 0 && callWrite < 0) return "Action: bearish carry remains, but downside may pause near put support.";
+    if (dir > 8) return "Action: buy-dip bias while FII stays net long.";
+    return "Action: wait for clearer FII alignment.";
+  }
+  if (name === "PRO") {
+    if (callWrite > putWrite && callWrite > 0) return "Action: respect resistance/call wall; upside may be capped.";
+    if (putWrite > callWrite && putWrite > 0) return "Action: respect support/put base; dips may be defended.";
+    return "Action: range trading is safer than chasing.";
+  }
+  if (name === "CLIENT") {
+    const fiiDir = Number(fii.directionalPct || 0);
+    const proDir = Number(pro.directionalPct || 0);
+    if (dir > 5 && (fiiDir < -5 || proDir < -5)) return "Action: beware long trap; do not chase upside without FII/Pro confirmation.";
+    if (dir < -5 && (fiiDir > 5 || proDir > 5)) return "Action: beware short trap; breakout can squeeze quickly.";
+    return "Action: use as contrarian only when it opposes FII/Pro.";
+  }
+  if (name === "DII") {
+    if (dir > 8) return "Action: background support is present, but confirm with FII/Pro before directional trades.";
+    if (dir < -8) return "Action: background support is weak; reduce long conviction.";
+    return "Action: secondary confirmation only.";
+  }
+  return "Action: no signal.";
+}
+
 function renderExcelModel(model) {
   const checks = model.checks || [];
   const traps = model.traps || [];
@@ -1693,6 +1794,19 @@ function renderExcelModel(model) {
       </div>
     `).join("")
     : `<div class="small">No trap model output.</div>`;
+  document.getElementById("playerReadPanel").innerHTML = matrix.length
+    ? matrix.map(row => `
+      <div class="read-card">
+        <div class="read-title">
+          <strong>${esc(row.name)}</strong>
+          <span class="${tone(Number(row.directionalPct || 0) + 50)}">${esc(playerStance(row))}</span>
+        </div>
+        <p><strong>Doing:</strong> ${esc(optionRead(row))}</p>
+        <p><strong>Meaning:</strong> ${esc(playerMeaning(row, matrix))}</p>
+        <p><strong>${esc(playerAction(row, matrix))}</strong></p>
+      </div>
+    `).join("")
+    : `<div class="small">Participant interpretation unavailable.</div>`;
   document.getElementById("playerMatrix").innerHTML = matrix.length
     ? matrix.map(row => `
       <tr>
